@@ -3,12 +3,68 @@ vcl 4.0;
 # Borrowed from mediawiki.org/wiki/Manual:Varnish_caching
 # and modified for Canasta
 
+# There are two goals here:
+# a) In an overload situation, prioritize logged in users
+# b) Limit max concurrency. Try to prevent the situation where a crawler
+#    hits a large number of uncached pages all at once, saturating CPU/Memory
+#    causing everything to slow to a halt. Better to delay and do a little at
+#    a time so progress is made, instead of all at once where the server becomes
+#    saturated and threads start piling up until timeouts are hit.
+
+# The way this works is by setting a max number of in-flight requests for certain
+# request types. Note that any cached response is returned immediately. Also if
+# different people are requesting the same page they are counted as only 1. The
+# idea is that there is a max amount of resources that logged out users can use so
+# they should not be able to overwhelm the server.
+
+# Note .wait_limit and .wait_timeout are new in varnish 7.6. Remove if using earlier varnish.
+
+# This is assuming a small wiki. If your wiki is really busy and normal logged out (non-malicious) users
+# are getting 503's, increase max_connections in anonview and anonspecial.
+
+# Logged in, api, load.php, images, anything else
 backend default {
     .host = "web";
     .port = "80";
     .first_byte_timeout = 120s; 
     .connect_timeout = 30s; 
     .between_bytes_timeout = 120s;
+}
+
+# Normal page view by an anon
+backend anonview {
+	.host = "web";
+	.port = "80";
+	.first_byte_timeout = 120s;
+	.connect_timeout = 30s;
+	.between_bytes_timeout = 120s;
+	.max_connections = 5;  # Set to 10 for a high traffic wiki. Set to 3 if wiki overwhelmed
+	.wait_limit = 50; # Set to 100 for busy wiki.
+	.wait_timeout = 60s;
+}
+
+# A special page view or ?action=history, etc.
+backend anonspecial {
+	.host = "web";
+	.port = "80";
+	.first_byte_timeout = 120s;
+	.connect_timeout = 30s;
+	.between_bytes_timeout = 120s;
+	.max_connections = 2; # Set to 5 for a high traffic wiki.
+	.wait_limit = 20; # Set to 100 for a high traffic wiki.
+	.wait_timeout = 30s;
+}
+
+# Stuff that is maybe evil.
+backend sus {
+	.host = "web";
+	.port = "80";
+	.first_byte_timeout = 120s;
+	.connect_timeout = 30s;
+	.between_bytes_timeout = 120s;
+	.max_connections = 1;
+	.wait_limit = 10;
+	.wait_timeout = 30s;
 }
 
 acl purge {
@@ -54,7 +110,7 @@ sub vcl_recv {
     if (req.url ~ "/w/api.php") {
         return(pass);
     }
-    
+
     call mobile_detect;
 
     # Pass requests from logged-in users directly.
@@ -62,6 +118,33 @@ sub vcl_recv {
     if (req.http.Authorization || req.http.Cookie ~ "([sS]ession|Token)=") {
         return (pass);
     } /* Not cacheable by default */
+
+    # logged out normal view
+    if (req.url ~ "/wiki/") {
+        set req.backend_hint = anonview;
+    }
+    # We are assuming english lang here
+    if (
+        ( req.url ~ "/w/index\.php" || req.url ~ "/wiki/Special:" || req.url ~ "[?&]action=" )
+        && req.url !~ "Special:UserLogin"
+    ) {
+        set req.backend_hint = anonspecial;
+    }
+
+    # Put suspicious looking user-agents in the slow lane.
+    # This likely has some false positives, so don't block entirely.
+    # An additional idea might be to use vthrottle to put IP addresses here if they
+    # request too much too fast.
+    if (
+        ( req.http.User-Agent !~ "Chrome/[1-9][3-9][0-9]" &&
+        req.http.User-Agent !~ "Firefox/[1-9][0-9][0-9]" &&
+        req.http.User-Agent !~ "Safari/[5-9][0-9][0-9]" ) ||
+        req.http.User-Agent ~ "Windows NT ([0-5]\.|6\.[01])" || 
+        req.http.User-Agent ~ "Mac OS X 10_[0-5]_" 
+    ) {
+        set req.backend_hint = sus;
+    }
+
 
     # Pass anything other than GET and HEAD directly.
     if (req.method != "GET" && req.method != "HEAD") {
@@ -115,10 +198,6 @@ sub vcl_backend_response {
             return (deliver);
         }
 
-       if (beresp.ttl < 48h) {
-          set beresp.ttl = 48h;
-        }       
- 
         if (!beresp.ttl > 0s) {
           set beresp.uncacheable = true;
           return (deliver);

@@ -70,12 +70,12 @@ services:
       - ./config/Caddyfile:/etc/caddy/Caddyfile
 
   varnish:
-    image: docker.io/library/varnish:7.0.2-alpine
+    image: docker.io/library/varnish:7.7.1-alpine
     restart: unless-stopped
     volumes:
        - ./config/default.vcl:/etc/varnish/default.vcl:ro
     tmpfs:
-      - /var/lib/varnish:exec
+      - /var/lib/varnish/varnishd:exec
 
 volumes:
   mysql-data-volume:
